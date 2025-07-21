@@ -1,0 +1,122 @@
+# artifactory_client.py
+from __future__ import annotations
+import mimetypes
+from pathlib import Path
+import requests
+
+import db_service                       # your in-memory “database”
+
+
+class ArtifactoryClient:
+    """
+    Tiny wrapper around the Artifactory REST API **plus** a light persistence
+    layer for the API key.
+
+    The key lives in `db_service`, which exposes:
+        save_api_key(key: str) -> None
+        get_api_key() -> str | None
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        api_key: str | None = None,
+        db_service=db_service,          # allow injection/mocking in tests
+    ) -> None:
+        self._db = db_service
+
+        # --- 1. obtain an API key -------------------------------------------
+        if api_key is None:
+            api_key = self._db.get_api_key()
+            if api_key is None:
+                raise ValueError(
+                    "No API key provided and none stored in db_service. "
+                    "Pass api_key=... when constructing ArtifactoryClient."
+                )
+        else:
+            # caller gave us a key → cache it for next time
+            self._db.save_api_key(api_key)
+
+        # --- 2. normalise base URL ------------------------------------------
+        if not base_url.endswith("/"):
+            base_url += "/"
+        if "/artifactory/" not in base_url:
+            base_url += "artifactory/"
+        self._base = base_url
+
+        # --- 3. prepare session ---------------------------------------------
+        self._s = requests.Session()
+        self._s.headers.update({"X-JFrog-Art-Api": api_key})
+
+    # --------------------------------------------------------------------- #
+    # everything below this line is IDENTICAL to the original implementation
+    # --------------------------------------------------------------------- #
+
+    def list_repositories(self, repo_type: str | None = None) -> list[dict]:
+        url = self._make_url("api", "repositories")
+        if repo_type:
+            url += f"?type={repo_type}"
+        return self._get_json(url)
+
+    def file_info(self, repo: str, path: str = "") -> dict:
+        url = self._make_url("api", "storage", repo, path)
+        return self._get_json(url)
+
+    def upload_file(
+        self,
+        repo: str,
+        remote_path: str,
+        local_path: str | Path,
+        *,
+        properties: dict[str, str] | None = None,
+    ) -> dict:
+        lp = Path(local_path)
+        url = self._make_url(repo, remote_path)
+        if properties:
+            url += ";" + ";".join(f"{k}={v}" for k, v in properties.items())
+
+        headers = {
+            "Content-Type": mimetypes.guess_type(lp.name)[0] or "application/octet-stream"
+        }
+        with lp.open("rb") as fh:
+            r = self._s.put(url, data=fh, headers=headers, timeout=300)
+        r.raise_for_status()
+        return r.json() if r.headers.get("Content-Type") == "application/json" else {}
+
+    def download_file(
+        self,
+        repo: str,
+        remote_path: str,
+        local_path: str | Path,
+        *,
+        chunk: int = 1 << 20,
+    ) -> Path:
+        lp = Path(local_path)
+        lp.parent.mkdir(parents=True, exist_ok=True)
+
+        url = self._make_url(repo, remote_path)
+        with self._s.get(url, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            with lp.open("wb") as fh:
+                for block in r.iter_content(chunk):
+                    fh.write(block)
+        return lp
+
+    # --- housekeeping ------------------------------------------------------
+
+    def close(self) -> None:
+        self._s.close()
+
+    def __enter__(self): return self
+    def __exit__(self, *_): self.close()
+
+    # --- internals ----------------------------------------------------------
+
+    def _make_url(self, *parts: str) -> str:
+        return self._base + "/".join(str(p).lstrip("/") for p in parts)
+
+    def _get_json(self, url: str) -> dict | list:
+        r = self._s.get(url, timeout=30)
+        r.raise_for_status()
+        return r.json()
